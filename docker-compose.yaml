@@ -1,0 +1,63 @@
+version: '3'
+
+services:
+  node-1:
+    container_name: node-1
+    build:
+      context: .
+      dockerfile: dockerfile-node
+    command: node node.js 1 "2,3,4"
+    ports:
+      - "8001:80"
+    networks:
+      - node-network
+
+  node-2:
+    container_name: node-2
+    build:
+      context: .
+      dockerfile: dockerfile-node
+    command: node node.js 2 "1,3,4"
+    ports:
+      - "8002:80"
+    networks:
+      - node-network
+
+  node-3:
+    container_name: node-3  
+    build:
+      context: .
+      dockerfile: dockerfile-node
+    command: node node.js 3 "1,2,4"
+    ports:
+      - "8003:80"
+    networks:
+      - node-network
+
+  node-4:
+    container_name: node-4
+    build:
+      context: .
+      dockerfile: dockerfile-node
+    command: node node.js 4 "1,2,3"
+    ports:
+      - "8004:80"
+    networks:
+      - node-network
+
+  server:
+    container_name: server
+    build:
+      context: .
+      dockerfile: dockerfile-server
+    command: node server.js
+    volumes:
+      - "./files:/app/files"
+    ports:
+      - "8005:80"
+    networks:
+      - node-network
+
+networks:
+  node-network:
+    driver: bridge
