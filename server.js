@@ -1,33 +1,27 @@
-// Utilizado para criar um servidor TCP que escuta as conexões de clientes.
 const net = require('net')
-// Utilizado para criar, ler, escrever e manipular arquivos no sistema de arquivos.
 const fs = require('fs')
-// Utilizado para obter o nome do host do sistema.
 const os = require('os')
-// É utilizado para construir caminhos de arquivos
-const path = require('path')
 
-// Configurações do servidor
-const serverHost = 'localhost'
-const serverPort = 8005
+const { promisify } = require('util')
+const appendFileAsync = promisify(fs.appendFile)
+
+const logging = {
+  info: (message) => console.log(`INFO: ${message}`)
+}
 
 class Server {
-  constructor() {
-    // Obter informações do sistema
+  constructor(serverHost = 'server', serverPort = 80) {
     this.hostname = os.hostname()
-    this.IPAddr = '127.0.0.1' // Altere conforme necessário
+    this.IPAddr = (os.networkInterfaces().lo0 && os.networkInterfaces().lo0[0]) ? os.networkInterfaces().lo0[0].address : '127.0.0.1'
 
-    // Configurações do servidor
     this.serverHost = serverHost
     this.serverPort = serverPort
     this.serverAddress = { host: this.serverHost, port: this.serverPort }
 
-    // Configurações do arquivo de log
-    this.folder = 'files'
-    this.file = 'logs.txt'
-    this.path = path.join(this.folder, this.file)
+    this.folder = "files"
+    this.file = "logs.txt"
+    this.path = `${this.folder}/${this.file}`
 
-    // Criar o arquivo de log se não existir
     this.createFile()
   }
 
@@ -36,72 +30,53 @@ class Server {
       fs.mkdirSync(this.folder)
     }
 
-    if (!fs.existsSync(this.path)) {
-      fs.writeFileSync(this.path, '')
-    }
+    fs.closeSync(fs.openSync(this.path, 'w'))
   }
 
-  _writeOnLogs(data) {
-    // Adicionar dados ao arquivo de log
-    const decodedData = data.toString('utf-8');
-    fs.appendFileSync(this.path, `${decodedData}\n`);
-    console.log('Data saved on log file');
+  async writeOnLogs(data) {
+    try {
+      await appendFileAsync(this.path, `${data}\n`)
+      logging.info('data saved on log file')
+    } catch (error) {
+      console.error(error)
+    }
   }
 
   initServer() {
     const dataPayload = 2048
     const server = net.createServer()
 
-    // Evento de 'listening' - ocorre quando o servidor começa a escutar
     server.on('listening', () => {
-      console.log(`Server is listening on ${this.IPAddr}:${this.serverPort}`)
+      logging.info(`Starting up echo server on ${this.IPAddr} port ${this.serverPort}`)
     })
 
-    // Evento de 'connection' - ocorre quando um cliente se conecta
-    server.on('connection', (socket) => {
-      console.log('Client connected')
-
-      // Evento de 'data' - ocorre quando dados são recebidos do cliente
-      socket.on('data', (data) => {
-        // Escrever dados no arquivo de log e enviá-los de volta ao cliente
-        this.writeOnLogs(data)
-        socket.write(data)
+    server.on('connection', (client) => {
+      logging.info("Waiting to receive message from client")
+      client.on('data', async (data) => {
+        try {
+          await this.writeOnLogs(data.toString('utf-8'))
+          client.write(data)
+        } catch (error) {
+          console.error(error)
+        }
       })
 
-      // Evento de 'end' - ocorre quando a conexão com o cliente é encerrada
-      socket.on('end', () => {
-        console.log('Client disconnected')
+      client.on('error', (error) => {
+        console.error(error)
       })
 
-      // Evento de 'error' - ocorre em caso de erro no socket
-      socket.on('error', (err) => {
-        console.error(`Socket error: ${err.message}`)
+      client.on('end', () => {
+        client.end()
       })
     })
 
-    // Evento de 'error' - ocorre em caso de erro no servidor
-    server.on('error', (err) => {
-      console.error(`Server error: ${err.message}`)
+    server.on('error', (error) => {
+      console.error(error)
     })
 
-    // Iniciar o servidor e fazê-lo escutar no endereço e porta especificados
-    server.listen(this.serverPort, this.IPAddr)
-  }
-  
-  resetRotationTimer() {
-    // Limpe o temporizador existente, se houver
-    if (rotationTimer) {
-      clearTimeout(rotationTimer);
-    }
-
-    // Configure um novo temporizador para a rotação
-    rotationTimer = setTimeout(() => {
-      // Inicie uma nova eleição após o intervalo de rotação
-      initiateElection();
-    }, rotationInterval);
+    server.listen(this.serverPort)
   }
 }
 
-// Criar uma instância do servidor e iniciar
-const serverInstance = new Server()
-serverInstance.initServer()
+const server = new Server()
+server.initServer()

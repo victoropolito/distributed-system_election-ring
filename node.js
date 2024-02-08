@@ -1,205 +1,252 @@
-const net = require('net');
-const os = require('os');
-const path = require('path');
-const { v4: uuidv4 } = require('uuid'); // Para gerar IDs únicos
+const net = require('net')
+const os = require('os')
+const { promisify } = require('util')
+const { performance } = require('perf_hooks')
+const { Mutex } = require('async-mutex')
+
+const logging = {
+  info: (message) => console.log(`INFO: ${message}`),
+  debug: (message) => console.log(`DEBUG: ${message}`),
+  error: (message) => console.error(`ERROR: ${message}`),
+}
+
+class Queue {
+  constructor() {
+    this.items = []
+  }
+
+  enqueue(element) {
+    this.items.push(element)
+  }
+
+  dequeue() {
+    if (this.isEmpty()) {
+      return "Underflow"
+    }
+    return this.items.shift()
+  }
+
+  isEmpty() {
+    return this.items.length === 0
+  }
+
+  front() {
+    if (this.isEmpty()) {
+      return "No elements in Queue"
+    }
+    return this.items[0]
+  }
+
+  printQueue() {
+    let str = ""
+    for (let i = 0; i < this.items.length; i++) {
+      str += this.items[i] + " "
+    }
+    return str
+  }
+}
 
 class Node {
-  constructor(deviceId, nodeIds, serverHost = 'localhost', serverPort = 8005) {
-    this.deviceId = parseInt(deviceId);
-    this.nodeIds = nodeIds.split(',').map(Number);
-    this.hostname = os.hostname();
-    this.IPAddr = '127.0.0.1'; // Altere conforme necessário
-
-    this.serverHost = serverHost;
-    this.serverPort = serverPort;
-    this.serverAddress = { host: this.serverHost, port: this.serverPort };
-
-    this.nodeElectionId = 4;
-    this.nodeElectionHost = `node-${this.nodeElectionId}`;
-    this.nodeElectionPort = 80;
-    this.nodeElectionAddress = { host: this.nodeElectionHost, port: this.nodeElectionPort };
-    this.nodeAddress = { host: `node-${this.deviceId}`, port: this.nodeElectionPort };
-    this.isElected = false;
-
-    this.electionsStarted = false;
-    this.actualElectionSendingNode = -1;
-
-    this.messageQueue = [];
-
-    this.setElectedNode();
+  constructor(serverHost = 'server', serverPort = 80) {
+    this.deviceId = parseInt(process.argv[2])
+    this.nodeList = process.argv[3].split(",").map(Number)
+    this.hostname = os.hostname()
+    this.IPAddr = (os.networkInterfaces().lo0 && os.networkInterfaces().lo0[0]) ? os.networkInterfaces().lo0[0].address : '127.0.0.1'
+    this.serverHost = serverHost
+    this.serverPort = serverPort
+    this.messageQuantity = 1000
+    this.serverAddress = { host: this.serverHost, port: this.serverPort }
+    this.nodeElectionId = 4
+    this.nodeElectionHost = `node-${this.nodeElectionId}`
+    this.nodeElectionPort = 80
+    this.nodeAddress = `node-${this.deviceId}`
+    this.nodeElectionAddress = { host: this.nodeElectionHost, port: this.nodeElectionPort }
+    this.isElected = false
+    this.electionsStarted = false
+    this.messageQueue = new Queue()
+    this.mutex = new Mutex()
+    this.setElectedNode()
   }
 
   setElectedNode() {
     if (this.nodeElectionId === this.deviceId) {
-      this.isElected = true;
+      this.isElected = true
     }
-    this.nodeElectionHost = `node-${this.nodeElectionId}`;
+    this.nodeElectionHost = `node-${this.nodeElectionId}`
   }
 
-  promoteNode(leader) {
-    console.log('Promoting leader');
-    this.nodeElectionId = leader;
-    this.nodeElectionHost = `node-${this.nodeElectionId}`;
-    if (this.nodeElectionId === this.deviceId) {
-      this.isElected = true;
+  async promoteNode(node) {
+    logging.info(`promoting node ${node} to leader`)
+    await this.mutex.runExclusive(async () => {
+      this.nodeElectionId = node
+      if (this.nodeElectionId === this.deviceId) {
+        this.isElected = true
+      }
+      this.nodeElectionHost = `node-${this.nodeElectionId}`
+      this.nodeElectionAddress = { host: this.nodeElectionHost, port: this.nodeElectionPort }
+      this.electionsStarted = false
+    })
+    logging.info(`node ${node} has been promoted`)
+    logging.info(`node_election_id = ${this.nodeElectionId} | node_election_address = ${this.nodeElectionAddress} | is_elected = ${this.isElected}`)
+  }
+
+  async processQueue() {
+    while (true) {
+      const data = await this.messageQueue.dequeue()
+      await this.sendMessage(data)
     }
   }
 
-  processQueue() {
-    while (this.messageQueue.length > 0) {
-      const data = this.messageQueue.shift();
-      this.sendMessage(data);
+  async electNewLeader() {
+    await this.mutex.runExclusive(async () => {
+      if (!this.electionsStarted) {
+        logging.info("electing new leader")
+        this.electionsStarted = true
+        this.isWhoStartedAElection = true
+        const nextNode = this.nodeList[0]
+        const customAddr = { host: `node-${nextNode}`, port: this.nodeElectionPort }
+        const message = `<ELECTION>${this.deviceId},${nextNode}`
+        logging.info(`send election message: ${message} to ${customAddr.host}:${customAddr.port}`)
+        await this.sendMessage(message, customAddr)
+      }
+    })
+  }
+
+  async doElection(message) {
+    logging.info("Ongoing election")
+    this.electionsStarted = true
+    if (this.nodeElectionId in this.nodeList) {
+      this.nodeList.splice(this.nodeList.indexOf(this.nodeElectionId), 1)
     }
-  }
+    const votingList = message.split(",").map(Number)
 
-  electNewLeader() {
-    console.log('Election in progress...');
-    this.electionsStarted = true;
-    this.actualElectionSendingNode = this.nodeIds[0];
-    this.nodeIds.shift();
-    const customAddr = { host: `node-${this.nodeIds[0]}`, port: this.nodeElectionPort };
-    const message = `<ELECTION>${this.deviceId}`;
-    console.log(`Send election message: ${message} to ${customAddr.host}:${customAddr.port}`);
-    this.sendMessage(message, customAddr);
-  }
+    if (!votingList.includes(this.deviceId)) {
+      const missingNodes = this.nodeList.filter(node => !votingList.includes(node))
+      let nextNode = votingList[0]
 
-  doElection(message) {
-    console.log('Election ongoing...');
-    const votingList = message.split(',').map(Number);
-    console.log(`${this.nodeElectionId} not in ${votingList}: ${!votingList.includes(this.nodeElectionId)}`);
-    if (!votingList.includes(this.nodeElectionId)) {
-      const missingNodes = this.nodeIds.filter(node => !votingList.includes(node));
-      const nextNode = missingNodes[0];
-      this.actualElectionSendingNode = nextNode;
-      const sendingMessage = `<ELECTION>${message},${this.deviceId}`;
-      const customAddr = { host: `node-${nextNode}`, port: this.nodeElectionPort };
-      console.log(`Sending ${sendingMessage} to ${customAddr.host}:${customAddr.port}`);
-      this.sendMessage(sendingMessage, customAddr);
-    } else {
-      console.log('Setting a Leader');
-      const leader = Math.max(...votingList);
-      const broadcastList = votingList.filter(node => node !== this.deviceId);
+      if (missingNodes.length > 0) {
+        nextNode = missingNodes[0]
+      }
 
-      for (const node of broadcastList) {
-        const message = `<LEADER>${leader}`;
-        const customAddr = { host: `node-${node}`, port: this.nodeElectionPort };
-        console.log(`Sending ${message} to ${customAddr.host}:${customAddr.port}`);
-        this.sendMessage(message, customAddr);
+      if (this.deviceId.toString() === message && votingList.filter(id => id === this.deviceId).length > 1) {
+        logging.info("Setting a Leader")
+        const leader = Math.max(...votingList)
+        const customAddr = { host: `node-${leader}`, port: this.nodeElectionPort }
+        const newLeaderMessage = `<LEADER>${leader}`
+        await this.sendMessage(newLeaderMessage, customAddr)
+        logging.info(`node ${leader} knows he is a leader`)
+        for (const nodeId of votingList) {
+          if (nodeId !== this.deviceId && nodeId !== leader) {
+            const customAddr = { host: `node-${nodeId}`, port: this.nodeElectionPort }
+            logging.info(`sending ${newLeaderMessage} to ${customAddr.host}:${customAddr.port}`)
+            await this.sendMessage(newLeaderMessage, customAddr)
+          }
+        }
+        await this.promoteNode(leader)
+      } else {
+        if (nextNode !== this.deviceId) {
+          const sendingMessage = `<ELECTION>${message},${nextNode}`
+          const customAddr = { host: `node-${nextNode}`, port: this.nodeElectionPort }
+          logging.info(`sending ${sendingMessage} to ${customAddr.host}:${customAddr.port}`)
+          await this.sendMessage(sendingMessage, customAddr)
+        }
       }
     }
   }
 
-  dataFormat(data) {
-    const messageSplited = data.split('>');
-    return { type: messageSplited[0].replace('<', '').replace('>', '').trim(), content: messageSplited[1].trim() };
+  async dataFormat(data) {
+    const messageSplited = data.split('>')
+    return [messageSplited[0].replace('<', '').replace('>', '').replace(' ', ''), messageSplited[1]]
   }
 
-  initNodeServer() {
-    const dataPayload = 2048;
-    const server = net.createServer();
+  async initNodeServer() {
+    const dataPayload = 2048
+    const server = net.createServer()
 
     server.on('listening', () => {
-      console.log(`Starting up echo server on ${this.nodeAddress.host}:${this.nodeAddress.port}`);
-    });
+      logging.info(`Starting up echo server on ${this.nodeAddress}`)
+    })
 
-    server.on('connection', (client) => {
-      console.log('Waiting to receive message from client');
+    server.on('connection', async (client) => {
+      logging.info("Waiting to receive message from client")
+      const data = await this.receiveMessage(client, dataPayload)
+      const [messageType, message] = await this.dataFormat(data.toString('utf-8'))
+      logging.info(`node-${this.deviceId} recived a message: ${messageType} - ${message}`)
 
-      client.on('data', (data) => {
-        const decodedMessage = data.toString('utf-8');
-        const { type, content } = this.dataFormat(decodedMessage);
-        console.log(`${type} - ${content}`);
-
-        if (data && this.isElected && type === 'SAVE') {
-          this.messageQueue.push(content);
-        }
-
-        if (data && type === 'ELECTION') {
-          this.electionsStarted = true;
-          if (!content.split(',').map(Number).includes(this.deviceId)) {
-            this.doElection(content);
-            setTimeout(() => {
-              this.electNewLeader();
-            }, 5000);
-          }
-        }
-
-        if (data && type === 'LEADER' && this.electionsStarted) {
-          if (!content.includes(this.deviceId.toString())) {
-            this.doElection(content);
-            this.electionsStarted = false;
-            setTimeout(() => {
-              this.electNewLeader();
-            }, 5000);
-          }
-        }
-
-        client.write(data);
-        client.end();
-      });
-
-      client.on('end', () => {
-        console.log('Client disconnected');
-      });
-
-      client.on('error', (err) => {
-        console.error(err.stack);
-      });
-    });
-
-    server.on('error', (err) => {
-      console.error(`Server error: ${err.message}`);
-    });
-
-    server.listen(this.nodeAddress.port, this.IPAddr);
-  }
-
-  sendMessage(message, customAddr) {
-    console.log('Starting send message process');
-    const client = new net.Socket();
-
-    client.on('error', (err) => {
-      console.error(`Error: ${err.message}`);
-      if (!this.electionsStarted) {
-        this.electNewLeader();
+      if (this.isElected && messageType === 'SAVE') {
+        await this.messageQueue.enqueue(message)
       }
-      client.destroy();
-    });
+      if (messageType === 'ELECTION') {
+        this.electionsStarted = true
+        await this.doElection(message)
+      }
+      if (messageType === 'LEADER' && this.electionsStarted) {
+        await this.promoteNode(parseInt(message))
+      }
 
-    client.connect(customAddr || this.serverAddress, () => {
-      console.log(`Sending ${message}`);
-      client.write(message);
-      client.end();
-    });
+      client.write(data)
+      client.end()
+    })
+
+    server.on('error', (error) => {
+      logging.error(error)
+    })
+
+    server.listen(this.nodeElectionPort)
   }
 
-  messageSpam() {
+  async sendMessage(message = '', customAddr = {}) {
+    logging.info("starting send message process")
+    const t0 = performance.now()
+    const sock = new net.Socket()
+    try {
+      if (this.isElected) {
+        await this.connectAndSend(sock, this.serverAddress, message)
+      } else if (customAddr.host && customAddr.port) {
+        await this.connectAndSend(sock, customAddr, message)
+      } else {
+        await this.connectAndSend(sock, this.nodeElectionAddress, message)
+      }
+    } catch (error) {
+      logging.error(`Other exception: ${error}`)
+    } finally {
+      sock.end()
+      const t1 = performance.now()
+      logging.info(`Closing connection to the server. Time taken: ${t1 - t0} milliseconds.`)
+    }
+  }
+
+  async connectAndSend(sock, address, message) {
+    sock.connect(address.port, address.host, () => {
+      logging.info(`Sending ${message}`)
+      sock.write(message)
+    })
+    await new Promise(resolve => sock.on('data', resolve))
+  }
+
+  async messageSpam() {
     if (!this.isElected && !this.electionsStarted) {
-      const message = `<SAVE>device_id = ${this.deviceId} | hostname = ${this.hostname} | ip = ${this.IPAddr} | timestamp = ${new Date()}`;
-      for (let i = 0; i < 100; i++) {
-        if (this.nodeElectionId === this.deviceId) {
-          this.sendMessage(message);
+      for (let i = 0; i < this.messageQuantity; i++) {
+        const message = `<SAVE>device_id = ${this.deviceId} | hostname = ${this.hostname} | ip = ${this.IPAddr} | timestamp = ${new Date().toISOString()} | leader = ${this.nodeElectionId}`
+        if (this.nodeElectionId && !this.electionsStarted && !this.isElected) {
+          await this.sendMessage(message)
         }
-        setTimeout(() => {
-          const randomNode = this.nodeIds[Math.floor(Math.random() * this.nodeIds.length)];
-          this.sendMessage(message, { host: `node-${randomNode}`, port: this.nodeElectionPort });
-        }, Math.floor(Math.random() * 4000) + 1000);
+        await new Promise(resolve => setTimeout(resolve, Math.floor(Math.random() * 10 + 1) * 1000))
       }
     }
   }
 }
 
-const deviceId = process.argv[2];
-const nodeIds = process.argv[3];
-const nodeInstance = new Node(deviceId, nodeIds);
-nodeInstance.initNodeServer();
+const node = new Node()
 
-setInterval(() => {
-  console.log('Starting processing thread');
-  nodeInstance.processQueue();
-}, 1000);
+logging.info("starting processing thread")
+const processingThread = node.processQueue.bind(node)
+processingThread()
 
-setInterval(() => {
-  console.log('Starting message spam thread');
-  nodeInstance.messageSpam();
-}, 10000);
+logging.info("starting server thread")
+const serverThread = node.initNodeServer.bind(node)
+serverThread()
+
+logging.info("starting message_spam thread")
+const messageSpamThread = node.messageSpam.bind(node)
+messageSpamThread()
